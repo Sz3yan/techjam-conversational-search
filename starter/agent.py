@@ -1,102 +1,103 @@
+"""Conversational shopping agent.
+
+Pipeline per turn:
+
+    observe -> route -> sparse retrieve -> rerank -> answer + clarify
+
+Runs entirely on the Python standard library: the catalog lives in an in-memory
+SQLite FTS5 index, and ranking is IDF-weighted constraint matching. No network
+access, no credentials, no model download.
+"""
+
 from __future__ import annotations
 
-import json
-import re
-import sqlite3
 from pathlib import Path
 
+from starter.ask import compose, next_attribute
+from starter.dense import DenseIndex
+from starter.rerank import rerank
+from starter.retrieve import CatalogIndex
+from starter.state import SessionState
 
-TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
-    "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
-    "that", "the", "this", "to", "want", "with", "would", "you", "looking",
-}
+# Candidate pool handed to the reranker. Browsing sessions start vague, so they
+# need a wider net; buying sessions arrive with a hard constraint and do better
+# with a tight, high-precision pool.
+POOL_BUYING = 100
+POOL_BROWSING = 200
 
+BROWSING_HINTS = ("still exploring", "not sure", "just looking", "browsing", "ideas")
 
-def _text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        return " ".join(f"{key} {item}" for key, item in value.items())
-    if isinstance(value, list):
-        return " ".join(str(item) for item in value)
-    return str(value)
-
-
-def _terms(text: str) -> list[str]:
-    return [
-        token.lower()
-        for token in TOKEN_RE.findall(text)
-        if len(token) > 1 and token.lower() not in STOPWORDS
-    ]
+# How many products to actually put in front of the customer.
+#
+# A session ends the moment the target appears in the scored list, which makes a
+# premature wide guess expensive: surfacing the right product at rank 9 banks a
+# reciprocal rank of 0.11 and forfeits every later chance to present it first.
+# So we commit to a single confident pick while turns remain to learn more, then
+# widen as the deadline approaches so a near-miss still lands in the window.
+NARROW_UNTIL = 5   # turns 1-5: one best guess
+SHORTLIST_UNTIL = 7  # turns 6-7: short list
+SHORTLIST_WIDTH = 3
 
 
 class Agent:
-    """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
+    """Required competition interface."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
-        self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
-        self._sessions: set[str] = set()
-        self._build_index()
-
-    def _build_index(self) -> None:
-        cursor = self.connection.cursor()
-        cursor.execute(
-            "CREATE VIRTUAL TABLE products USING fts5("
-            "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
-        )
-        batch: list[tuple[str, str, str, str, str, str, str]] = []
-        with self.catalog_path.open(encoding="utf-8") as handle:
-            for line in handle:
-                product = json.loads(line)
-                batch.append(
-                    (
-                        str(product["parent_asin"]),
-                        _text(product.get("title")),
-                        _text(product.get("categories")),
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
-                    )
-                )
-                if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-                    batch.clear()
-        if batch:
-            cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-        self.connection.commit()
+        self.index = CatalogIndex(catalog_path)
+        # Optional. Absent cached embeddings or numpy, this stays disabled and
+        # the agent runs as a pure-stdlib sparse system.
+        self.dense = DenseIndex(catalog_path)
+        self.sessions: dict[str, SessionState] = {}
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # The profile is anonymized and may be used for personalization.
-        self._sessions.add(session_id)
+        self.sessions[session_id] = SessionState(session_id, user_profile)
 
-    def respond(
-        self,
-        session_id: str,
-        user_message: str,
-        turn: int,
-        top_k: int,
-    ) -> dict:
-        if session_id not in self._sessions:
-            raise RuntimeError("reset must be called before respond")
-        unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
-        if not expression:
-            recommendations: list[dict] = []
-        else:
-            rows = self.connection.execute(
-                "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
-                (expression, top_k),
-            ).fetchall()
-            recommendations = [{"parent_asin": str(row[0])} for row in rows]
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        # Never raise: the evaluator scores an exception as a lost session.
+        state = self.sessions.get(session_id)
+        if state is None:
+            state = self.sessions[session_id] = SessionState(session_id, {})
+
+        state.observe(user_message, turn)
+
+        pool_size = POOL_BUYING if self._is_buying(state) else POOL_BROWSING
+        candidates = self.index.search(state.query_terms(), pool_size)
+        dense_scores = None
+        if self.dense.available:
+            dense_scores = self.dense.similarity(self._semantic_query(state), candidates)
+        ordered = rerank(self.index, state, candidates, dense_scores=dense_scores)
+        picks = ordered[:self._width(turn, top_k)]
+
+        state.record_shown(picks, turn)
+        attribute = next_attribute(state)
+        state.asked.append(attribute)
+
         return {
-            "message": "Here are the closest matches I found.",
-            "ask_attribute": None,
-            "recommendations": recommendations,
+            "message": compose(state, attribute, len(picks)),
+            "ask_attribute": attribute,
+            "recommendations": [{"parent_asin": parent_asin} for parent_asin in picks],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
+
+    @staticmethod
+    def _semantic_query(state: SessionState) -> str:
+        """Natural-language rendering of the session for the encoder."""
+        parts = [state.category or ""]
+        parts.extend(constraint["text"] for constraint in state.constraints)
+        return ", ".join(part for part in parts if part)
+
+    @staticmethod
+    def _width(turn: int, top_k: int) -> int:
+        """Recommendation count for this turn: narrow early, wide at the end."""
+        if turn <= NARROW_UNTIL:
+            return 1
+        if turn <= SHORTLIST_UNTIL:
+            return min(SHORTLIST_WIDTH, top_k)
+        return top_k
+
+    def _is_buying(self, state: SessionState) -> bool:
+        """Buying discloses a hard constraint up front; browsing starts vague."""
+        opening = state.history[0].lower() if state.history else ""
+        if any(hint in opening for hint in BROWSING_HINTS):
+            return False
+        return bool(state.constraints)
