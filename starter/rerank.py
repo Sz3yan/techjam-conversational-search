@@ -25,6 +25,19 @@ def _weighted(index: CatalogIndex, tokens: list[str]) -> list[tuple[str, float]]
     return [(token, index.idf(token)) for token in tokens]
 
 
+def _discriminance(index: CatalogIndex, tokens: list[str]) -> float:
+    """How much satisfying this constraint narrows the catalog.
+
+    Constraints are not equally informative: "leather" and "Imported" each
+    appear in over ten thousand of the fifty thousand products, while a
+    distinctive feature sentence appears in one. Weighting every disclosure
+    equally lets the generic ones drown out the decisive one. The rarest token
+    dominates a clause's selectivity, so its IDF is the natural proxy -- and it
+    is free, unlike counting verbatim clause occurrences across the catalog.
+    """
+    return max(index.idf(token) for token in tokens) if tokens else 1.0
+
+
 def _coverage(index: CatalogIndex, parent_asin: str, weighted: list[tuple[str, float]]) -> float:
     """Fraction of a phrase's IDF mass present in the product text."""
     if not weighted:
@@ -47,11 +60,16 @@ def rerank(
     if not candidates:
         return []
 
-    constraints = [
-        (_weighted(index, tokenize(constraint["text"])), normalize(constraint["text"]).strip())
-        for constraint in state.constraints
-    ]
-    constraints = [(weighted, phrase) for weighted, phrase in constraints if weighted]
+    constraints = []
+    for constraint in state.constraints:
+        tokens = tokenize(constraint["text"])
+        if not tokens:
+            continue
+        constraints.append((
+            _weighted(index, tokens),
+            normalize(constraint["text"]).strip(),
+            _discriminance(index, tokens),
+        ))
     category = _weighted(index, tokenize(state.category or ""))
     ruled_out = state.ruled_out()
     pool = float(len(candidates))
@@ -61,11 +79,14 @@ def rerank(
         value = W_BM25 * (1.0 - rank / pool)
         if constraints:
             hit = 0.0
-            for weighted, phrase in constraints:
-                hit += _coverage(index, parent_asin, weighted)
+            total_weight = 0.0
+            for weighted, phrase, discriminance in constraints:
+                matched = _coverage(index, parent_asin, weighted)
                 if phrase and f" {phrase} " in index.blob.get(parent_asin, ""):
-                    hit += phrase_weight
-            value += W_CONSTRAINT * hit / len(constraints)
+                    matched += phrase_weight
+                hit += matched * discriminance
+                total_weight += discriminance
+            value += W_CONSTRAINT * hit / (total_weight or 1.0)
         if category:
             blob = index.category_blob.get(parent_asin, "")
             found = sum(w for token, w in category if f" {token} " in blob)

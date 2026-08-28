@@ -5,25 +5,25 @@ E-Commerce Search Challenge. It locates a hidden target product inside a frozen
 50,000-item Amazon apparel catalog by accumulating constraints across a
 bounded 10-turn dialogue.
 
-**TechnicalScore 0.9327 on the 200 public sessions, up from the 0.1067 weak
-baseline — 8.7×.** Runs on the Python standard library alone: no network, no
+**TechnicalScore 0.9373 on the 200 public sessions, up from the 0.1067 weak
+baseline — 8.8×.** Runs on the Python standard library alone: no network, no
 credentials, no model download, 7.6 ms median per turn.
 
 ## Results
 
 | Metric | Baseline | This agent | Best possible |
 |---|---|---|---|
-| Hit Rate@10 | 0.125 | **0.985** | 1.000 |
-| MRR | 0.068 | **0.952** | 1.000 |
-| MTTC | 9.81 | **3.27** | 1.39 |
-| Efficiency | 0.119 | **0.772** | 0.961 |
-| **TechnicalScore** | **0.1067** | **0.9327** | **0.9922** |
+| Hit Rate@10 | 0.125 | **0.990** | 1.000 |
+| MRR | 0.068 | **0.957** | 1.000 |
+| MTTC | 9.81 | **3.25** | 1.39 |
+| Efficiency | 0.119 | **0.775** | 0.961 |
+| **TechnicalScore** | **0.1067** | **0.9373** | **0.9922** |
 
 By scenario:
 
 | Scenario | n | Hit@10 | MRR | MTTC |
 |---|---|---|---|---|
-| Buying | 80 | 0.975 | 0.959 | 2.85 |
+| Buying | 80 | 0.988 | 0.972 | 2.77 |
 | Browsing | 80 | 1.000 | 0.979 | 2.99 |
 | Intent Override | 30 | 1.000 | 0.933 | 4.17 |
 | Boundary | 10 | 0.900 | 0.742 | 6.30 |
@@ -81,7 +81,15 @@ The override replaces a stated preference but does not change the target
 product, so earlier disclosures remain true of it. Erase the contradicted slot,
 never the context.
 
-**3. Narrow early, widen late — worth +0.062.** The session ends at the *first*
+**3. Constraint discriminance, not constraint count.** Disclosures are wildly
+unequal: "leather" and "Imported" each appear verbatim in over 10,000 of the
+50,000 products, while a distinctive feature sentence appears in one. Only 1 in
+24 constraints is unique. Weighting every disclosure equally lets the generic
+ones drown out the decisive one, so each constraint is weighted by the IDF of
+its rarest token. Worth +0.005, and free — unlike counting verbatim clause
+occurrences, which costs a full catalog scan and scored *worse* (0.9363).
+
+**4. Narrow early, widen late — worth +0.062.** The session ends at the *first*
 hit. Surfacing the target at rank 9 on turn 2 banks a reciprocal rank of 0.111
 and forfeits every later chance to present it first; holding back and returning
 it at rank 1 two turns later is worth 1.0. With MRR weighted 0.30 against
@@ -91,8 +99,8 @@ turn 8 so a near-miss still lands in the scored window.
 
 | Policy | Hit@10 | MRR | MTTC | Score |
 |---|---|---|---|---|
-| Always return 10 | 0.990 | 0.684 | 2.48 | 0.8705 |
-| **Narrow → widen** | 0.985 | **0.952** | 3.27 | **0.9327** |
+| Always return 10 | 0.990 | 0.684 | 2.48 | 0.8715 |
+| **Narrow → widen** | 0.990 | **0.957** | 3.25 | **0.9373** |
 
 This is a deliberate precision-over-recall stance, and it matches how a chat
 interface actually behaves: a conversational assistant offers one confident
@@ -111,9 +119,27 @@ customer utterance to break all marker strings while preserving its information:
 | No ruled-out elimination | 0.8847 | 0.8859 |
 | Neither (pure IDF matching) | 0.8642 | 0.8555 |
 
-**Degradation under full paraphrase: −1.3%.** Stripping both simulator-specific
-mechanisms still leaves 0.8642. The result does not depend on the public set's
+**Degradation under full paraphrase: −1.8%.** Stripping both simulator-specific
+mechanisms still leaves 0.8643. The result does not depend on the public set's
 literal phrasing.
+
+### Stress testing the recommendation-width policy
+
+Narrowing is the single largest design bet (+0.062), and it assumes rank-1
+precision stays high. If the private sessions are harder, narrowing could mean
+never surfacing the target at all. We tested that directly under two
+independent stressors — paraphrased customers, and deliberately crippled
+extraction that discards every second disclosure — plus both at once:
+
+| Policy | clean | paraphrased | starved | both |
+|---|---|---|---|---|
+| Always return 10 | 0.8715 | 0.8724 | 0.8613 | 0.8347 |
+| Adaptive (widen when information dries up) | 0.9288 | 0.9172 | 0.9070 | 0.8787 |
+| **Fixed narrow → widen (shipped)** | **0.9373** | **0.9204** | **0.9095** | **0.8900** |
+
+The shipped policy wins in every condition, including the compound one, and an
+information-driven adaptive variant did not beat it. The bet is validated
+rather than assumed.
 
 ## Negative result: the dense route does not help
 
