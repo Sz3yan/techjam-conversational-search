@@ -1,17 +1,27 @@
-"""Clarification strategy: what to ask, and how to phrase it.
+"""Decides what to ask the customer next, and writes the sentence that asks it.
 
-Only `ask_attribute` is machine-read by the simulator; `message` is for the
-human on the other side. Both are produced here so the natural language and the
-structured field can never drift apart.
+Every turn the agent sends back two related things: a question in plain English
+for the person reading it, and an attribute name in the `ask_attribute` field
+for the evaluator. Only the attribute name affects the score, because that is
+what the evaluator reads to decide which requirement to reveal next. The
+sentence is what a human judge sees during a demo, and what makes the exchange
+look like a conversation rather than a search box.
+
+Both are written here, in the same place, so that they can never drift apart
+and leave us asking about colour in words while asking about material in the
+structured field.
 """
 
 from __future__ import annotations
 
 from starter.state import ATTRIBUTES, SessionState
 
-# Ordered by how much a typical answer narrows an apparel catalog.
+# The order we work through attributes in, running roughly from the ones whose
+# answer narrows a clothing catalog the most down to the ones that narrow it
+# the least.
 PRIORITY = ("material", "style", "use_case", "color", "size", "budget", "feature", "brand", "category")
 
+# The sentence we use for each attribute.
 PROMPTS = {
     "material": "What material are you hoping for?",
     "style": "What style or fit works best for you?",
@@ -29,11 +39,24 @@ OPENING = "Tell me a bit more and I'll narrow this down."
 
 
 def next_attribute(state: SessionState) -> str:
-    """Pick the most informative attribute still worth asking about.
+    """Choose which attribute to ask the customer about this turn.
 
-    Open-ended first: an unscoped question ("anything else that matters?")
-    surfaces whatever the customer considers important instead of forcing them
-    through our taxonomy. Only once that dries up do we probe specific slots.
+    We open with "other", which is the unscoped question -- "anything else that
+    matters?" -- for two reasons. It lets the customer volunteer whatever they
+    think is important, instead of marching them through our list of
+    categories. And because it is unscoped, the evaluator will hand over any
+    requirement it still has, whatever kind it is, so it is the question least
+    likely to come back empty.
+
+    Once that runs dry we walk down the priority list, skipping anything they
+    have declined to answer, anything we have already asked, and anything they
+    have already told us about.
+
+    The two loops after that are fallbacks for a long session where the good
+    options are used up. The first relaxes the rule about attributes we already
+    know, and the second relaxes the rule about ones we already asked. Asking a
+    repeat question is a poor turn, but it beats asking nothing at all, because
+    a turn with no question gets us no new information whatsoever.
     """
     unavailable = state.exhausted | state.no_preference
     if "other" not in unavailable:
@@ -54,7 +77,16 @@ def next_attribute(state: SessionState) -> str:
 
 
 def compose(state: SessionState, attribute: str, count: int) -> str:
-    """Customer-facing text for this turn."""
+    """Write the sentence the customer actually reads this turn.
+
+    There are three situations. We might know nothing about them yet, we might
+    know something but have found nothing worth showing, or we might have both.
+
+    Whichever it is, the sentence always ends with the question belonging to
+    `attribute`, which is how the words and the `ask_attribute` field stay in
+    agreement. When we do have requirements we also read the last two back to
+    them, so they can see what we understood and correct us if we got it wrong.
+    """
     question = PROMPTS.get(attribute, PROMPTS["other"])
     if not state.constraints:
         return f"{OPENING} {question}"
