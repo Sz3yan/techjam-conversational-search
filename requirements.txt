@@ -1,0 +1,7 @@
+# The agent's default configuration needs nothing on this list: it runs on the
+# Python 3.10+ standard library alone, with no network access.
+#
+# numpy is required only to build and use the optional dense retrieval channel
+# (scripts/build_embeddings.py). Without it the agent detects the missing
+# dependency and runs the sparse path, which is the shipped configuration.
+numpy>=1.24 ; python_version >= "3.10"
