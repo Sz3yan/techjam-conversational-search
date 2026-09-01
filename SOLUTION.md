@@ -455,7 +455,3 @@ override-conversion gate, so roughly 0.037 is genuinely addressable.
 
 **Weight tuning is exhausted.** A full sweep of both pool sizes and all rerank
 weights moved nothing outside ±0.005. Further gains require a new signal.
-
-## Team contributions
-
-_To be completed._
